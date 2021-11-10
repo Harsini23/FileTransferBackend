@@ -1,0 +1,144 @@
+require("dotenv").config();
+var express = require("express");
+const mongoose = require("mongoose");
+var app = express();
+var multer = require("multer");
+const crypto = require("crypto");
+const { GridFsStorage } = require("multer-gridfs-storage");
+var Grid = require("gridfs-stream");
+const bodyParser = require("body-parser");
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
+const path = require("path");
+var assert = require("assert");
+var cors = require("cors");
+var mongodb = require("mongodb");
+var fs = require("fs");
+
+const File = require("./schema");
+let filename;
+
+const PORT = process.env.PORT || 8000;
+const URI = process.env.MONGO_CONNECTION_URL;
+
+app.use(cors());
+
+const conn = mongoose.createConnection(process.env.MONGO_CONNECTION_URL);
+
+//get files from react and store in mongodb
+//start
+let gfs;
+conn.once("open", () => {
+  //Init stream
+  /*  gfs = Grid(conn.db, mongoose.mongo);
+  gfs.collection("uploads"); */
+
+  gfs = new mongoose.mongo.GridFSBucket(conn.db, { bucketName: "fs" });
+});
+
+//create storage engine
+const storage = new GridFsStorage({
+  url: process.env.MONGO_CONNECTION_URL,
+  file: (req, file) => {
+    return new Promise((resolve, reject) => {
+      crypto.randomBytes(16, (err, buf) => {
+        if (err) {
+          return reject(err);
+        }
+        const originalname = file.originalname;
+        filename = buf.toString("hex") + path.extname(file.originalname);
+        const fileInfo = {
+          filename: filename,
+          bucketName: "fs",
+        };
+        console.log(originalname);
+        console.log(filename);
+        resolve(fileInfo);
+      });
+    });
+  },
+});
+const upload = multer({ storage }).single("file");
+//end
+
+//post
+
+const fileSizeFormatter = (bytes, decimal) => {
+  if (bytes === 0) {
+    return "0 Bytes";
+  }
+  const dm = decimal || 2;
+  const sizes = ["Bytes", "KB", "MB", "GB", "TB", "PB", "EB", "YB", "ZB"];
+  const index = Math.floor(Math.log(bytes) / Math.log(1000));
+  return (
+    parseFloat((bytes / Math.pow(1000, index)).toFixed(dm)) + " " + sizes[index]
+  );
+};
+
+const today = new Date();
+const tomorrow = new Date(today);
+tomorrow.setDate(tomorrow.getDate() + 1);
+
+app.post("/", upload, (req, res) => {
+  const { file } = req;
+  const { id } = file;
+  console.log("the file uploaded id is:" + id);
+
+  const fileInfo = new File({
+    originalFilename: req.file.originalname,
+    fileSize: fileSizeFormatter(req.file.size, 2),
+    fileType: req.file.mimetype,
+    UploadedDate: req.file.uploadDate,
+    ValidTillDate: tomorrow,
+    fileId: id,
+  });
+  console.log(fileInfo);
+  //fileInfo.save();
+
+  fileInfo.save(function (err, result) {
+    if (err) {
+      console.log(err);
+    } else {
+      console.log(result);
+    }
+  });
+  //const { file } = req;
+  // const { id } = file;
+  //console.log(id);
+  //const _id = new mongoose.Types.ObjectId(id);
+  // console.log(_id);
+  res.json({ file: req.file });
+});
+
+app.get("/download", (req, res) => {
+  mongoose.connect(URI, function (error, db) {
+    assert.ifError(error);
+
+    var gridfsbucket = new mongodb.GridFSBucket(db, {
+      chunkSizeBytes: 1024,
+      bucketName: "fs",
+    });
+    gridfsbucket
+      .openDownloadStreamByName("cc04f35d680e242ab60a034e3dcf3c19.jpg")
+      .pipe(fs.createWriteStream("./cc04f35d680e242ab60a034e3dcf3c19.jpg"))
+      .on("error", () => {
+        console.log("Some error occurred in download:" + error);
+        res.send(error);
+      })
+      .on("finish", () => {
+        console.log("done downloading");
+        res.send("Done Downloading");
+      });
+  });
+});
+
+app.get("/getLink", function (req, res) {
+  res.json({
+    success: true,
+    download: `http://localhost:3000/downloadFile?filename=${filename}`,
+  });
+});
+
+app.listen(PORT, function () {
+  console.log("App running on port " + PORT);
+});
