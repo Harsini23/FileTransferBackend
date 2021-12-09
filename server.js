@@ -6,35 +6,37 @@ var multer = require("multer");
 const crypto = require("crypto");
 const { GridFsStorage } = require("multer-gridfs-storage");
 var Grid = require("gridfs-stream");
-const bodyParser = require("body-parser");
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 const path = require("path");
 var assert = require("assert");
 var cors = require("cors");
 var mongodb = require("mongodb");
-var fs = require("fs");
+const schedule = require("node-schedule");
+const moment = require("moment");
 
 const File = require("./schema");
 let filename;
 
+//port connection and getting url from env
 const PORT = process.env.PORT || 8000;
 const URI = process.env.MONGO_CONNECTION_URL;
 
-app.use(cors());
-
+//establishing connection to grid using mongoose
 const conn = mongoose.createConnection(process.env.MONGO_CONNECTION_URL);
-
-//get files from react and store in mongodb
-//start
+// var GridFS = Grid(conn, mongoose.mongo);
 let gfs;
+
 conn.once("open", () => {
   //Init stream
-  /*  gfs = Grid(conn.db, mongoose.mongo);
-  gfs.collection("uploads"); */
-
-  gfs = new mongoose.mongo.GridFSBucket(conn.db, { bucketName: "fs" });
+  /* gfs = Grid(conn.db, mongoose.mongo);
+  gfs.collection("fs"); */
+  gfs = new mongoose.mongo.GridFSBucket(conn.db, {
+    bucketName: "fs",
+  });
 });
+
+app.use(cors());
 
 //create storage engine
 const storage = new GridFsStorage({
@@ -45,24 +47,20 @@ const storage = new GridFsStorage({
         if (err) {
           return reject(err);
         }
-        const originalname = file.originalname;
         filename = buf.toString("hex") + path.extname(file.originalname);
         const fileInfo = {
           filename: filename,
           bucketName: "fs",
         };
-        console.log(originalname);
-        console.log(filename);
+
         resolve(fileInfo);
       });
     });
   },
 });
 const upload = multer({ storage }).single("file");
-//end
 
-//post
-
+//function to calc size of file
 const fileSizeFormatter = (bytes, decimal) => {
   if (bytes === 0) {
     return "0 Bytes";
@@ -74,70 +72,104 @@ const fileSizeFormatter = (bytes, decimal) => {
     parseFloat((bytes / Math.pow(1000, index)).toFixed(dm)) + " " + sizes[index]
   );
 };
+//function to format file extension
+const getFileExtension = (completeFilename) => {
+  var extension = completeFilename.substring(
+    completeFilename.lastIndexOf(".") + 1
+  );
+  return extension;
+};
 
+//User info and link expiry date
 const today = new Date();
 const tomorrow = new Date(today);
 tomorrow.setDate(tomorrow.getDate() + 1);
+let sender = "Anonymous";
+let validTill = tomorrow;
 
+//api to get user details from user
+app.post("/userData", function (req, res) {
+  sender = req.body.senderName;
+  validTill = req.body.validTill;
+});
+
+//file and file details upload to mongodb
 app.post("/", upload, (req, res) => {
   const { file } = req;
   const { id } = file;
-  console.log("the file uploaded id is:" + id);
-
   const fileInfo = new File({
     originalFilename: req.file.originalname,
     fileSize: fileSizeFormatter(req.file.size, 2),
     fileType: req.file.mimetype,
     UploadedDate: req.file.uploadDate,
-    ValidTillDate: tomorrow,
+    ValidTillDate: validTill,
     fileId: id,
+    encryptedFileName: req.file.filename,
+    senderName: sender,
+    iconFileFormat: getFileExtension(req.file.filename),
   });
-  console.log(fileInfo);
-  //fileInfo.save();
-
   fileInfo.save(function (err, result) {
     if (err) {
+      res.status(503).json({ message: "Unable to process request" });
       console.log(err);
     } else {
-      console.log(result);
+      res.status(200).json({ message: "File uploaded" });
     }
   });
-  //const { file } = req;
-  // const { id } = file;
-  //console.log(id);
-  //const _id = new mongoose.Types.ObjectId(id);
-  // console.log(_id);
-  res.json({ file: req.file });
 });
 
-app.get("/download", (req, res) => {
+//api to get download link
+app.get("/getLink", function (req, res) {
+  res.json({
+    success: true,
+    download: `https://swoosh-55d68.web.app/download?filename=${filename}`,
+  });
+});
+
+//api to download the file from mongodb
+app.get("/downloaded/:filename", (req, res) => {
   mongoose.connect(URI, function (error, db) {
     assert.ifError(error);
-
     var gridfsbucket = new mongodb.GridFSBucket(db, {
       chunkSizeBytes: 1024,
       bucketName: "fs",
     });
+    res.setHeader("Content-Type", "blob");
     gridfsbucket
-      .openDownloadStreamByName("cc04f35d680e242ab60a034e3dcf3c19.jpg")
-      .pipe(fs.createWriteStream("./cc04f35d680e242ab60a034e3dcf3c19.jpg"))
-      .on("error", () => {
-        console.log("Some error occurred in download:" + error);
-        res.send(error);
+      .openDownloadStreamByName(req.params.filename)
+      .on("error", function (error) {
+        res.status(503).json({ message: "Try again later", time: 5 });
       })
-      .on("finish", () => {
-        console.log("done downloading");
-        res.send("Done Downloading");
-      });
+      .on("finish", function () {
+        res.status(200).json({ message: "Success" });
+      })
+      .pipe(res);
   });
 });
 
-app.get("/getLink", function (req, res) {
-  res.json({
-    success: true,
-    download: `http://localhost:3000/downloadFile?filename=${filename}`,
+//scheduler that deletes the file every 3 hours when validity expires
+schedule.scheduleJob("0 0 */3 * * *", function () {
+  File.find().then((data) => {
+    let currentdate = moment();
+    data.map((obj) => {
+      let objDate = moment(obj.ValidTillDate);
+      if (moment(objDate).diff(currentdate) < 0) {
+        let fileId = obj.fileId;
+        File.deleteOne({ _id: obj._id }, function (err) {
+          if (err) {
+            console.log(err);
+          }
+        });
+        const obj_id = new mongoose.Types.ObjectId(fileId);
+        gfs.delete(obj_id);
+        console.log({ msg: "deletion successss" });
+      }
+    });
   });
 });
+
+//api to fetch file info for download page viewing
+app.use("/showDetails", require("./routes/showDetails"));
 
 app.listen(PORT, function () {
   console.log("App running on port " + PORT);
